@@ -22,6 +22,10 @@ from .models import (
     BatchParseRequest,
     BatchParseResponse,
     BatchParseResult,
+    AltitudeRange,
+    Coordinates,
+    Radius,
+    TimeSchedule,
 )
 
 router = APIRouter()
@@ -40,10 +44,10 @@ async def health_check():
     llm_enabled = bool(settings.openai_api_key)
     return HealthResponse(
         status="healthy",
-        version="0.2.0",
+        version="0.3.0",
         llm_enabled=llm_enabled,
         qcode_coverage=176,  # 支持 176 种 QCODE
-        fir_coverage=60,     # 支持 60 个 FIR
+        fir_coverage=102,     # 支持 102 个 FIR (79.1% 覆盖率)
     )
 
 
@@ -89,6 +93,7 @@ async def parse_notam(request: NotamParseRequest):
         q_line=_q_line_to_response(regex_result.q_line) if regex_result.q_line else None,
         a_location=regex_result.a_location,
         time_window=_build_time_window(regex_result),
+        altitude_range=_build_altitude_range(regex_result),
         e_raw=regex_result.e_raw,
         warnings=regex_result.warnings,
         errors=regex_result.errors,
@@ -162,14 +167,23 @@ def _extract_notam_id(notam_text: str) -> Optional[NotamIdentifier]:
     series = match.group(1)
     number = match.group(2)
     year = match.group(3)
-    type_ = match.group(4)
+    type_ = match.group(4) or "NOTAMN"
+
+    # 提取 NOTAMR 替换关系
+    replaces = None
+    if type_.upper() == "NOTAMR":
+        notamr_pattern = re.compile(r'NOTAMR\s+([A-Z]\d{4}/\d{2})')
+        notamr_match = notamr_pattern.search(notam_text)
+        if notamr_match:
+            replaces = notamr_match.group(1)
 
     return NotamIdentifier(
         series=series,
         number=number,
         year=year,
-        type=type_.upper() if type_ else "NOTAMN",
-        full_id=f"{series}{number}/{year}{(' ' + type_) if type_ else ''}",
+        type=type_.upper(),
+        full_id=f"{series}{number}/{year} {type_}",
+        replaces=replaces,
     )
 
 
@@ -178,12 +192,36 @@ def _build_time_window(regex_result: ParseResult) -> Optional[TimeWindow]:
     if not regex_result.b_time and not regex_result.c_time:
         return None
 
+    # 解析 D 行结构化时间表
+    schedules = []
+    for d_sched in regex_result.d_schedules:
+        schedules.append(TimeSchedule(
+            start=d_sched.start.isoformat() if d_sched.start else None,
+            end=d_sched.end.isoformat() if d_sched.end else None,
+            recurrence=d_sched.recurrence,
+            raw=d_sched.raw,
+        ))
+
     return TimeWindow(
         start=regex_result.b_time.isoformat() if regex_result.b_time else None,
         end=regex_result.c_time.isoformat() if regex_result.c_time else None,
-        is_permanent=regex_result.d_schedule is not None and "PERM" in regex_result.d_schedule.upper(),
-        is_estimated=False,  # EST 标记在 C 行解析中未捕获，需后续增强
+        is_permanent=regex_result.c_is_perm,
+        is_estimated=regex_result.c_is_est,
         schedule=regex_result.d_schedule,
+        schedules=schedules,
+    )
+
+
+def _build_altitude_range(regex_result: ParseResult) -> Optional[AltitudeRange]:
+    """构建高度范围"""
+    if not regex_result.altitude_range:
+        return None
+
+    return AltitudeRange(
+        lower=regex_result.altitude_range.lower,
+        upper=regex_result.altitude_range.upper,
+        lower_source=regex_result.altitude_range.lower_source,
+        upper_source=regex_result.altitude_range.upper_source,
     )
 
 
@@ -191,6 +229,15 @@ def _q_line_to_response(q_line) -> QLineResponse:
     """将 QLineResult 转换为 QLineResponse"""
     decoder = RegexParser()
     decoded = decoder.decode_q_line(q_line)
+
+    # 解析坐标和半径
+    coords_parsed = None
+    radius_parsed = None
+
+    if q_line.coordinates:
+        coords_parsed = decoder.parse_coordinate(q_line.coordinates)
+    if q_line.radius:
+        radius_parsed = decoder.parse_radius(q_line.radius)
 
     return QLineResponse(
         fir=q_line.fir,
@@ -207,6 +254,16 @@ def _q_line_to_response(q_line) -> QLineResponse:
         upper_altitude=q_line.upper_altitude,
         coordinates=q_line.coordinates,
         radius=q_line.radius,
+        coordinates_parsed=Coordinates(
+            latitude=coords_parsed.latitude,
+            longitude=coords_parsed.longitude,
+            raw=coords_parsed.raw,
+        ) if coords_parsed else None,
+        radius_parsed=Radius(
+            value=radius_parsed.value,
+            unit=radius_parsed.unit,
+            raw=radius_parsed.raw,
+        ) if radius_parsed else None,
         raw=q_line.raw,
     )
 

@@ -95,8 +95,9 @@ E)RUNWAY CLSD"""
         # 检查基本字段
         assert data["q_line"] is not None
         assert data["a_location"] is not None
-        assert "b_time" in data
-        assert "c_time" in data
+        assert data["time_window"] is not None
+        assert data["time_window"]["start"] is not None
+        assert data["time_window"]["end"] is not None
         assert "e_raw" in data
 
     def test_parse_with_llm_disabled(self, client):
@@ -172,7 +173,7 @@ E)RUNWAY CLSD"""
         assert response.status_code == 200
         data = response.json()
 
-        assert data["b_time"] is None
+        assert data["time_window"] is None
         assert len(data["errors"]) > 0
 
 
@@ -232,9 +233,9 @@ E)TEST"""
         data = response.json()
         q_line = data["q_line"]
 
-        # traffic 字段是原始值 "I"，需要检查解码后的描述
-        assert q_line["traffic"] == "I"
-        # code_description 应该包含 IFR 相关信息
+        # traffic 字段是原始值 "IV"（IFR+VFR 都适用）
+        assert q_line["traffic"] == "IV"
+        # code_description 应该包含机场关闭相关信息
         assert "Aerodrome" in q_line["code_description"] or "closed" in q_line["code_description"].lower()
 
 
@@ -256,8 +257,9 @@ E)TEST"""
         data = response.json()
 
         # 时间应该是 ISO 8601 格式或为 None（如果解析失败）
-        if data["b_time"]:
-            assert "2024-03-15" in data["b_time"] or "24-03-15" in data["b_time"]
+        time_window = data.get("time_window")
+        if time_window and time_window.get("start"):
+            assert "2024-03-15" in time_window["start"] or "24-03-15" in time_window["start"]
 
     def test_c_time_iso_format(self, client):
         """C 行 ISO 8601 格式"""
@@ -275,8 +277,10 @@ E)TEST"""
         data = response.json()
 
         # 时间应该是 ISO 8601 格式
-        assert data["c_time"] is not None
-        assert "2024-03-15" in data["c_time"] or "24-03-15" in data["c_time"]
+        time_window = data.get("time_window")
+        assert time_window is not None
+        assert time_window.get("end") is not None
+        assert "2024-03-15" in time_window["end"] or "24-03-15" in time_window["end"]
 
 
 class TestMultipleAirports:

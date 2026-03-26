@@ -18,7 +18,7 @@ class TestQLineParser:
 
         assert result.fir == "EGTT"
         assert result.notam_code == "QFALC"
-        assert result.traffic == "I"
+        assert result.traffic == "IV"  # IV = IFR + VFR 都适用
         assert result.purpose == "NBO"
         assert result.scope == "A"
         assert result.lower_altitude == "000"

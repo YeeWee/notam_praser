@@ -1,10 +1,13 @@
 """NOTAM 解析 API 响应模型
 
-基于真实 NOTAM 数据（2005 条）分析结果设计，覆盖：
+基于真实 NOTAM 数据（2000 条）分析结果设计，覆盖：
 - 176 种唯一 QCODE
 - NOTAMN/NOTAMR/NOTAMC 类型
 - 多系列（A/B/E/F/H 等）
 - 完整的 Q 行解码
+- F/G 行高度层解析
+- D 行结构化时间表
+- 坐标/半径结构化解析
 """
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
@@ -17,6 +20,36 @@ class NotamType(str, Enum):
     NEW = "NOTAMN"           # 新 NOTAM
     REPLACE = "NOTAMR"       # 替换现有 NOTAM
     CANCEL = "NOTAMC"        # 取消现有 NOTAM
+
+
+class AltitudeRange(BaseModel):
+    """高度范围（F 行和 G 行）"""
+    lower: Optional[str] = Field(None, description="下层高度 (如 '2500FT', 'SFC', 'FL025')")
+    upper: Optional[str] = Field(None, description="上层高度 (如 'FL125', 'UNL')")
+    lower_source: str = Field("F", description="来源：F=F 行，Q=Q 行 lower 字段")
+    upper_source: str = Field("G", description="来源：G=G 行，Q=Q 行 upper 字段")
+
+
+class Coordinates(BaseModel):
+    """解析后的坐标"""
+    latitude: float = Field(..., description="纬度 (度，如 51.783)")
+    longitude: float = Field(..., description="经度 (度，如 -0.467)")
+    raw: str = Field(..., description="原始字符串 (如 5147N00028W)")
+
+
+class Radius(BaseModel):
+    """解析后的半径"""
+    value: int = Field(..., description="半径值")
+    unit: str = Field("NM", description="单位 (NM=海里)")
+    raw: str = Field(..., description="原始字符串 (如 005)")
+
+
+class TimeSchedule(BaseModel):
+    """D 行时间段"""
+    start: Optional[str] = Field(None, description="开始时间 (ISO 8601)")
+    end: Optional[str] = Field(None, description="结束时间 (ISO 8601)")
+    recurrence: Optional[str] = Field(None, description="重复规则 (如 DAILY, MON-FRI)")
+    raw: str = Field(..., description="原始 D 行文本")
 
 
 class QLineResponse(BaseModel):
@@ -41,6 +74,10 @@ class QLineResponse(BaseModel):
     coordinates: Optional[str] = Field(None, description="坐标 (如 5147N00028W)")
     radius: Optional[str] = Field(None, description="半径 (如 005=5NM)")
 
+    # 新增结构化字段
+    coordinates_parsed: Optional[Coordinates] = Field(None, description="解析后的坐标")
+    radius_parsed: Optional[Radius] = Field(None, description="解析后的半径")
+
     # 原始 Q 行文本
     raw: Optional[str] = Field(None, description="原始 Q 行文本")
 
@@ -55,6 +92,9 @@ class NotamIdentifier(BaseModel):
     # 完整标识符 (如 A0766/26 NOTAMN)
     full_id: Optional[str] = Field(None, description="完整 NOTAM ID")
 
+    # 新增字段：NOTAMR 替换关系
+    replaces: Optional[str] = Field(None, description="NOTAMR 替换的原始 NOTAM ID")
+
 
 class TimeWindow(BaseModel):
     """时间窗口"""
@@ -63,6 +103,9 @@ class TimeWindow(BaseModel):
     is_permanent: bool = Field(False, description="是否永久生效 (PERM)")
     is_estimated: bool = Field(False, description="是否预计时间 (EST)")
     schedule: Optional[str] = Field(None, description="时间段/重复性 (D 行)")
+
+    # 新增字段：D 行多段时问解析
+    schedules: List[TimeSchedule] = Field(default_factory=list, description="D 行多段时问解析")
 
 
 class EParsedResponse(BaseModel):
@@ -134,6 +177,12 @@ class NotamParseResponse(BaseModel):
         description="时间窗口"
     )
 
+    # ==================== F/G 行：高度范围 ====================
+    altitude_range: Optional[AltitudeRange] = Field(
+        None,
+        description="高度范围 (F 行和 G 行)"
+    )
+
     # ==================== E 行：内容 ====================
     e_raw: Optional[str] = Field(None, description="E 行原始文本")
     e_parsed: Optional[EParsedResponse] = Field(
@@ -152,7 +201,7 @@ class NotamParseResponse(BaseModel):
     )
 
     # ==================== 解析元数据 ====================
-    parser_version: str = Field("0.2.0", description="解析器版本")
+    parser_version: str = Field("0.3.0", description="解析器版本")
 
 
 class HealthResponse(BaseModel):

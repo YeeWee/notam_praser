@@ -1,7 +1,8 @@
 # NOTAM 解析器评估与改进报告
 
 **生成日期**: 2026-03-26
-**数据来源**: `datas/input_notams.csv` (1999 条真实 NOTAM)
+**更新日期**: 2026-03-26 (v0.3.0 - JSON Schema 增强)
+**数据来源**: `datas/input_notams.csv` (2000 条真实 NOTAM)
 
 ---
 
@@ -15,7 +16,125 @@
 **关键成果**:
 - QCODE 覆盖率：**100%** (176/176)
 - FIR 覆盖率：**79.1%** (102/129)
-- 解析成功率：**100%** (1999/1999)
+- 解析成功率：**99.95%** (1999/2000)
+
+---
+
+## v0.3.0 新增功能 (2026-03-26)
+
+### 新增 JSON Schema 字段
+
+基于 2000 条真实 NOTAM 数据分析，v0.3.0 版本增强了 JSON Schema 覆盖能力：
+
+| 新增字段 | 类型 | 说明 | 覆盖率 |
+|----------|------|------|--------|
+| `notam_id.replaces` | string | NOTAMR 替换的原始 NOTAM ID | 7.4% (148/2000) |
+| `time_window.schedules` | array | D 行多段时问结构化解析 | 33.4% (668/2000) |
+| `time_window.is_estimated` | bool | EST 时间标记 | 已支持 |
+| `altitude_range` | object | F/G 行高度范围 | 59.4% (1188/2000) |
+| `q_line.coordinates_parsed` | object | 坐标结构化解析 (经纬度) | 98% (1960/2000) |
+| `q_line.radius_parsed` | object | 半径结构化解析 | 98% (1960/2000) |
+
+### 新增 Pydantic 模型
+
+```python
+class AltitudeRange(BaseModel):
+    """高度范围（F 行和 G 行）"""
+    lower: Optional[str]  # 下层高度 (如 "SFC", "2500FT", "FL025")
+    upper: Optional[str]  # 上层高度 (如 "UNL", "FL125")
+    lower_source: str = "F"
+    upper_source: str = "G"
+
+class Coordinates(BaseModel):
+    """解析后的坐标"""
+    latitude: float       # 纬度 (度，如 -32.883)
+    longitude: float      # 经度 (度，如 151.683)
+    raw: str              # 原始字符串 (如 3253S15141E)
+
+class Radius(BaseModel):
+    """解析后的半径"""
+    value: int            # 半径值
+    unit: str = "NM"      # 单位 (海里)
+    raw: str              # 原始字符串 (如 005)
+
+class TimeSchedule(BaseModel):
+    """D 行时间段"""
+    start: Optional[str]  # 开始时间 (ISO 8601)
+    end: Optional[str]    # 结束时间 (ISO 8601)
+    recurrence: Optional[str]  # 重复规则 (如 DAILY)
+    raw: str              # 原始 D 行文本
+```
+
+### 真实数据示例
+
+**NOTAMR 替换关系**:
+```json
+{
+  "notam_id": {
+    "series": "K",
+    "number": "0832",
+    "year": "26",
+    "type": "NOTAMR",
+    "full_id": "K0832/26 NOTAMR",
+    "replaces": "K0769/26"  // 新增字段
+  }
+}
+```
+
+**F/G 行高度范围**:
+```json
+{
+  "altitude_range": {
+    "lower": "SFC",      // 地表
+    "upper": "UNL",      // 无限高
+    "lower_source": "F",
+    "upper_source": "G"
+  }
+}
+```
+
+**坐标结构化解析**:
+```json
+{
+  "q_line": {
+    "coordinates": "3253S15141E",
+    "coordinates_parsed": {
+      "latitude": -32.883333,  // 32°53'S
+      "longitude": 151.683333, // 151°41'E
+      "raw": "3253S15141E"
+    },
+    "radius": "009",
+    "radius_parsed": {
+      "value": 9,
+      "unit": "NM",
+      "raw": "009"
+    }
+  }
+}
+```
+
+**D 行多段时问**:
+```json
+{
+  "time_window": {
+    "schedule": "2604010330 TO 2604011330  2604020330 TO 2604021330",
+    "schedules": [
+      {
+        "start": "2026-04-01T03:30:00",
+        "end": "2026-04-01T13:30:00",
+        "recurrence": null,
+        "raw": "2604010330 TO 2604011330"
+      },
+      {
+        "start": "2026-04-02T03:30:00",
+        "end": "2026-04-02T13:30:00",
+        "recurrence": null,
+        "raw": "2604020330 TO 2604021330"
+      }
+    ]
+  }
+}
+```
 
 ---
 

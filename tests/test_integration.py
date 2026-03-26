@@ -301,7 +301,9 @@ E)TEST"""
 
         assert response.status_code == 200
         data = response.json()
-        assert data["c_time"] is None
+        # time_window 应该存在但 end 为 None
+        assert data["time_window"] is not None
+        assert data["time_window"]["end"] is None
 
 
 class TestConcurrencyIntegration:
