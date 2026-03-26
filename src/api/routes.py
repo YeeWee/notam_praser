@@ -1,90 +1,37 @@
 """NOTAM 解析 API 路由
 
-提供同步解析端点，接收 NOTAM 文本，返回结构化 JSON
+提供同步解析端点，接收 NOTAM 文本，返回结构化 JSON。
+基于真实 NOTAM 数据（2005 条，176 种 QCODE）设计。
 """
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
+import re
 
 from ..parsers.regex_parser import RegexParser, ParseResult
-from ..parsers.llm_parser import LLMParser, parse_notam_e_line
+from ..parsers.llm_parser import LLMParser
+from ..parsers.qcode_database import get_qcode_description, get_fir_description
 from ..config import get_settings
+from .models import (
+    NotamParseRequest,
+    NotamParseResponse,
+    NotamIdentifier,
+    QLineResponse,
+    TimeWindow,
+    EParsedResponse,
+    HealthResponse,
+    BatchParseRequest,
+    BatchParseResponse,
+    BatchParseResult,
+)
 
 router = APIRouter()
 settings = get_settings()
 
-
-class NotamParseRequest(BaseModel):
-    """NOTAM 解析请求"""
-    notam_text: str = Field(..., description="原始 NOTAM 文本")
-    include_llm: bool = Field(
-        default=True,
-        description="是否启用 LLM 解析（摘要、翻译、分类等）"
-    )
-    context: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="上下文信息（如 Q 行解析结果）"
-    )
-
-
-class TerminologyItem(BaseModel):
-    """术语解释项"""
-    term: str
-    expansion: str
-    category: Optional[str] = None
-
-
-class RestrictedArea(BaseModel):
-    """限制区域"""
-    name: Optional[str] = None
-    type: Optional[str] = None
-    coordinates: Optional[str] = None
-    altitude_limits: Optional[str] = None
-    time_limits: Optional[str] = None
-    description: Optional[str] = None
-
-
-class QLineResponse(BaseModel):
-    """Q 行解析结果"""
-    fir: Optional[str] = None
-    fir_name: Optional[str] = None
-    notam_code: Optional[str] = None
-    code_description: Optional[str] = None
-    traffic: Optional[str] = None
-    purpose: Optional[str] = None
-    scope: Optional[str] = None
-    lower_altitude: Optional[str] = None
-    upper_altitude: Optional[str] = None
-    coordinates: Optional[str] = None
-    radius: Optional[str] = None
-
-
-class NotamParseResponse(BaseModel):
-    """NOTAM 解析响应"""
-    # Q 行解析
-    q_line: Optional[QLineResponse] = None
-    # A 行：适用机场/空域
-    a_location: Optional[List[str]] = None
-    # B 行：生效时间 (ISO 8601)
-    b_time: Optional[str] = None
-    # C 行：结束时间 (ISO 8601)
-    c_time: Optional[str] = None
-    # D 行：时间段/重复性
-    d_schedule: Optional[str] = None
-    # E 行：原始文本
-    e_raw: Optional[str] = None
-    # E 行：LLM 解析结果
-    e_parsed: Optional[Dict[str, Any]] = None
-    # 警告和错误
-    warnings: List[str] = Field(default_factory=list)
-    errors: List[str] = Field(default_factory=list)
-
-
-class HealthResponse(BaseModel):
-    """健康检查响应"""
-    status: str
-    version: str
-    llm_enabled: bool
+# NOTAM ID 模式：A0766/26 NOTAMN
+NOTAM_ID_PATTERN = re.compile(
+    r'^([A-Z])(\d{4})/(\d{2})\s*(NOTAMN|NOTAMR|NOTAMC)?',
+    re.IGNORECASE
+)
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -93,8 +40,10 @@ async def health_check():
     llm_enabled = bool(settings.openai_api_key)
     return HealthResponse(
         status="healthy",
-        version="0.1.0-mvp",
-        llm_enabled=llm_enabled
+        version="0.2.0",
+        llm_enabled=llm_enabled,
+        qcode_coverage=176,  # 支持 176 种 QCODE
+        fir_coverage=60,     # 支持 60 个 FIR
     )
 
 
@@ -105,9 +54,10 @@ async def parse_notam(request: NotamParseRequest):
     接收原始 NOTAM 文本，返回结构化解析结果。
 
     解析流程：
-    1. 正则解析层：提取 Q/A/B/C/D/E 行结构化字段
-    2. LLM 解析层（可选）：解析 E 行语义（摘要、翻译、分类、术语、限制区域）
-    3. 术语库校验：验证 LLM 输出的术语解释
+    1. NOTAM ID 提取：解析系列、编号、年份、类型
+    2. 正则解析层：提取 Q/A/B/C/D/E 行结构化字段
+    3. Q 行解码：FIR 名称、QCODE 描述、交通类型等
+    4. LLM 解析层（可选）：解析 E 行语义
 
     Args:
         request: NOTAM 解析请求
@@ -117,7 +67,6 @@ async def parse_notam(request: NotamParseRequest):
 
     Raises:
         HTTPException: 400 - 无效的 NOTAM 文本
-        HTTPException: 500 - LLM 解析失败
     """
     # 验证输入
     if not request.notam_text or not request.notam_text.strip():
@@ -126,75 +75,120 @@ async def parse_notam(request: NotamParseRequest):
             detail="NOTAM 文本不能为空"
         )
 
-    # 初始化解析器
-    regex_parser = RegexParser()
+    # Step 1: 提取 NOTAM ID
+    notam_id = _extract_notam_id(request.notam_text)
 
-    # Step 1: 正则解析层
+    # Step 2: 正则解析层
+    regex_parser = RegexParser()
     regex_result = regex_parser.parse(request.notam_text)
 
-    # 构建响应
+    # Step 3: 构建响应
     response = NotamParseResponse(
+        notam_id=notam_id,
+        raw_input=request.notam_text,
         q_line=_q_line_to_response(regex_result.q_line) if regex_result.q_line else None,
         a_location=regex_result.a_location,
-        b_time=regex_result.b_time.isoformat() if regex_result.b_time else None,
-        c_time=regex_result.c_time.isoformat() if regex_result.c_time else None,
-        d_schedule=regex_result.d_schedule,
+        time_window=_build_time_window(regex_result),
         e_raw=regex_result.e_raw,
         warnings=regex_result.warnings,
-        errors=regex_result.errors
+        errors=regex_result.errors,
     )
 
-    # Step 2: LLM 解析层（可选）
+    # Step 4: LLM 解析层（可选）
     if request.include_llm and regex_result.e_raw:
-        try:
-            # 构建上下文（Q 行解码结果）
-            context = None
-            if regex_result.q_line:
-                q_decoder = regex_parser.decode_q_line(regex_result.q_line)
-                context = {"q_line": q_decoder}
-
-            # 调用 LLM 解析器
-            llm_parser = LLMParser(
-                api_key=settings.openai_api_key,
-                api_base=settings.openai_api_base,
-                model=settings.openai_model
-            )
-            llm_result = llm_parser.parse_with_retry(
-                e_text=regex_result.e_raw,
-                context=context,
-                max_retries=settings.llm_max_retries
-            )
-
-            # 构建 E 行解析结果
-            response.e_parsed = {
-                "summary": llm_result.summary,
-                "translation": llm_result.translation,
-                "category": llm_result.category,
-                "terminology": llm_result.terminology,
-                "restricted_areas": llm_result.restricted_areas,
-                "validation_report": llm_result.validation_report,
-                "raw_llm_response": llm_result.raw_llm_response
-            }
-
-        except Exception as e:
-            # LLM 解析失败，不中断整体解析
-            response.warnings.append(f"LLM 解析失败：{str(e)}")
-            response.e_parsed = {
-                "summary": None,
-                "translation": None,
-                "category": None,
-                "terminology": [],
-                "restricted_areas": [],
-                "error": f"LLM 解析失败：{str(e)}"
-            }
+        _add_llm_parsing(response, regex_result, request.context)
 
     return response
 
 
+@router.post("/parse/batch", response_model=BatchParseResponse)
+async def parse_notam_batch(request: BatchParseRequest):
+    """批量解析 NOTAM
+
+    Args:
+        request: 批量解析请求
+
+    Returns:
+        批量解析结果
+    """
+    results: List[BatchParseResult] = []
+    success_count = 0
+    failed_count = 0
+
+    for i, notam_text in enumerate(request.notam_texts):
+        try:
+            # 复用单条解析逻辑
+            parse_request = NotamParseRequest(
+                notam_text=notam_text,
+                include_llm=request.include_llm,
+            )
+            result = await parse_notam(parse_request)
+            results.append(BatchParseResult(
+                index=i,
+                result=result,
+                error=None,
+            ))
+            success_count += 1
+        except Exception as e:
+            results.append(BatchParseResult(
+                index=i,
+                result=None,
+                error=str(e),
+            ))
+            failed_count += 1
+
+    return BatchParseResponse(
+        total=len(request.notam_texts),
+        success=success_count,
+        failed=failed_count,
+        results=results,
+    )
+
+
+def _extract_notam_id(notam_text: str) -> Optional[NotamIdentifier]:
+    """提取 NOTAM ID
+
+    支持格式：
+    - A0766/26 NOTAMN
+    - A0766/26 NOTAMR
+    - A0766/26 NOTAMC
+    """
+    first_line = notam_text.strip().split('\n')[0]
+    match = NOTAM_ID_PATTERN.match(first_line)
+
+    if not match:
+        return None
+
+    series = match.group(1)
+    number = match.group(2)
+    year = match.group(3)
+    type_ = match.group(4)
+
+    return NotamIdentifier(
+        series=series,
+        number=number,
+        year=year,
+        type=type_.upper() if type_ else "NOTAMN",
+        full_id=f"{series}{number}/{year}{(' ' + type_) if type_ else ''}",
+    )
+
+
+def _build_time_window(regex_result: ParseResult) -> Optional[TimeWindow]:
+    """构建时间窗口"""
+    if not regex_result.b_time and not regex_result.c_time:
+        return None
+
+    return TimeWindow(
+        start=regex_result.b_time.isoformat() if regex_result.b_time else None,
+        end=regex_result.c_time.isoformat() if regex_result.c_time else None,
+        is_permanent=regex_result.d_schedule is not None and "PERM" in regex_result.d_schedule.upper(),
+        is_estimated=False,  # EST 标记在 C 行解析中未捕获，需后续增强
+        schedule=regex_result.d_schedule,
+    )
+
+
 def _q_line_to_response(q_line) -> QLineResponse:
     """将 QLineResult 转换为 QLineResponse"""
-    from ..parsers.regex_parser import RegexParser
-
     decoder = RegexParser()
     decoded = decoder.decode_q_line(q_line)
 
@@ -204,10 +198,64 @@ def _q_line_to_response(q_line) -> QLineResponse:
         notam_code=q_line.notam_code,
         code_description=decoded.get("code_description"),
         traffic=q_line.traffic,
+        traffic_decoded=decoded.get("traffic"),
         purpose=q_line.purpose,
+        purpose_decoded=decoded.get("purpose"),
         scope=q_line.scope,
+        scope_decoded=decoded.get("scope"),
         lower_altitude=q_line.lower_altitude,
         upper_altitude=q_line.upper_altitude,
         coordinates=q_line.coordinates,
-        radius=q_line.radius
+        radius=q_line.radius,
+        raw=q_line.raw,
     )
+
+
+def _add_llm_parsing(
+    response: NotamParseResponse,
+    regex_result: ParseResult,
+    context: Optional[Dict[str, Any]] = None,
+):
+    """添加 LLM 解析结果到响应"""
+    try:
+        # 构建上下文（Q 行解码结果）
+        llm_context = None
+        if regex_result.q_line:
+            q_decoder = RegexParser().decode_q_line(regex_result.q_line)
+            llm_context = {"q_line": q_decoder}
+
+        # 调用 LLM 解析器
+        llm_parser = LLMParser(
+            api_key=settings.openai_api_key,
+            api_base=settings.openai_api_base,
+            model=settings.openai_model,
+        )
+        llm_result = llm_parser.parse_with_retry(
+            e_text=regex_result.e_raw,
+            context=llm_context,
+            max_retries=settings.llm_max_retries,
+        )
+
+        # 构建 E 行解析结果
+        response.e_parsed = EParsedResponse(
+            summary=llm_result.summary,
+            translation=llm_result.translation,
+            category=llm_result.category,
+            terminology=llm_result.terminology,
+            restricted_areas=llm_result.restricted_areas,
+            validation_report=llm_result.validation_report,
+            raw_llm_response=llm_result.raw_llm_response,
+        )
+
+    except Exception as e:
+        # LLM 解析失败，不中断整体解析
+        response.warnings.append(f"LLM 解析失败：{str(e)}")
+        response.e_parsed = EParsedResponse(
+            summary=None,
+            translation=None,
+            category=None,
+            terminology=[],
+            restricted_areas=[],
+            validation_report={"error": f"LLM 解析失败：{str(e)}"},
+            raw_llm_response=None,
+        )

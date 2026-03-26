@@ -7,6 +7,8 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 
+from .qcode_database import get_qcode_description, get_fir_description
+
 
 @dataclass
 class QLineResult:
@@ -87,28 +89,13 @@ class RegexParser:
         lines = notam_text.strip().split('\n')
 
         for line in lines:
-            line = line.strip()
-            if not line:
+            line_stripped = line.strip()
+            if not line_stripped:
                 continue
 
-            # 解析 Q 行
-            if line.startswith('Q)'):
-                result.q_line = self._parse_q_line(line)
-            # 解析 A 行
-            elif line.startswith('A)'):
-                result.a_location = self._parse_a_line(line)
-            # 解析 B 行
-            elif line.startswith('B)'):
-                result.b_time = self._parse_time_line(line, self.B_LINE_PATTERN)
-            # 解析 C 行
-            elif line.startswith('C)'):
-                result.c_time = self._parse_time_line(line, self.C_LINE_PATTERN)
-            # 解析 D 行
-            elif line.startswith('D)'):
-                result.d_schedule = self._parse_d_line(line)
-            # 解析 E 行
-            elif line.startswith('E)'):
-                result.e_raw = self._parse_e_line(notam_text)
+            # 处理同一行上可能有多个字段的情况 (如 A)OEJD B)2603121818 C)2603132359)
+            # 使用正则查找所有字段
+            self._parse_line_fields(line_stripped, result, notam_text)
 
         # 验证必填字段
         if result.q_line is None:
@@ -119,6 +106,39 @@ class RegexParser:
             result.errors.append("缺少 B 行")
 
         return result
+
+    def _parse_line_fields(self, line: str, result: ParseResult, notam_text: str):
+        """解析单行中的所有字段（支持多字段同行）"""
+        # 查找 Q 行
+        if 'Q)' in line or line.startswith('Q)'):
+            q_match = re.search(r'Q\)\s*([^A-Z]*[A-Z]{2,4}/[A-Z]{5}/[^E]+)', line)
+            if q_match:
+                q_line_full = 'Q)' + q_match.group(1)
+                result.q_line = self._parse_q_line(q_line_full)
+
+        # 查找 A 行
+        a_match = re.search(r'A\)\s*([A-Z]{4}(?:\s+[A-Z]{4})*)', line)
+        if a_match:
+            result.a_location = self._parse_a_line('A)' + a_match.group(1))
+
+        # 查找 B 行
+        b_match = re.search(r'B\)\s*(\d{10,12})', line)
+        if b_match:
+            result.b_time = self._parse_time_line('B)' + b_match.group(1), self.B_LINE_PATTERN)
+
+        # 查找 C 行
+        c_match = re.search(r'C\)\s*(\d{10,12})(?:\s+(EST|PERM))?', line)
+        if c_match:
+            result.c_time = self._parse_time_line('C)' + c_match.group(1), self.C_LINE_PATTERN)
+
+        # 查找 D 行
+        d_match = re.search(r'D\)\s*(.+?)(?=\s+[EZ]\)|$)', line, re.IGNORECASE)
+        if d_match:
+            result.d_schedule = self._parse_d_line('D)' + d_match.group(1))
+
+        # 查找 E 行（只处理行首的 E)）
+        if line.startswith('E)'):
+            result.e_raw = self._parse_e_line(notam_text)
 
     def _parse_q_line(self, line: str) -> QLineResult:
         """解析 Q 行"""
@@ -210,20 +230,52 @@ class RegexParser:
         in_e_section = False
 
         for line in lines:
-            if line.strip().startswith('E)'):
+            stripped = line.strip()
+            if stripped.startswith('E)'):
                 in_e_section = True
-                content = line.replace('E)', '').strip()
+                content = line.replace('E)', '').replace('E) ', '').strip()
                 if content:
                     e_lines.append(content)
             elif in_e_section:
-                # E 行结束于 Z) 或下一个字段行（但不是 continuation）
-                stripped = line.strip()
-                if stripped.startswith('Z)') or (stripped.startswith(('A)', 'B)', 'C)', 'D)')) and len(stripped) < 10):
+                # E 行结束于 NNNN、Z) 或下一个字段行
+                if stripped.startswith(('NNNN', 'Z)')):
                     break
-                if stripped:
+                # 检查是否是新的 NOTAM 块（以引号或 NOTAM ID 开头）
+                if stripped.startswith('"') or re.match(r'^[A-Z]\d{4}/\d{2}', stripped):
+                    break
+                if stripped and not stripped.startswith(('A)', 'B)', 'C)', 'D)', 'Q)')):
                     e_lines.append(stripped)
 
-        return '\n'.join(e_lines)
+        return ' '.join(e_lines)
+
+    @staticmethod
+    def load_notam_from_csv(csv_path: str) -> List[str]:
+        """从 CSV 文件加载 NOTAM 文本列表
+
+        支持多行 NOTAM 格式（以 NNNN 分隔）
+
+        Args:
+            csv_path: CSV 文件路径
+
+        Returns:
+            NOTAM 文本列表
+        """
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # 移除 BOM
+        content = content.replace('\ufeff', '')
+
+        # NOTAM 之间用 NNNN 分隔
+        notam_blocks = content.split('NNNN')
+        notams = []
+
+        for block in notam_blocks:
+            block = block.strip().strip('"').strip()
+            if block:
+                notams.append(block)
+
+        return notams
 
     def decode_q_line(self, q_line: QLineResult) -> Dict[str, Any]:
         """解码 Q 行各字段的语义
@@ -251,41 +303,54 @@ class RegexParser:
 
     def _decode_fir(self, fir: Optional[str]) -> Optional[str]:
         """解码飞行情报区"""
-        fir_names = {
-            "EGTT": "London FIR (UK)",
-            "EGTT": "London Flight Information Region",
-            "ZBPE": "Beijing FIR (China)",
-            "ZSHA": "Shanghai FIR (China)",
-            "ZGZU": "Guangzhou FIR (China)",
-            "ZPKM": "Kunming FIR (China)",
-            "KZNY": "New York ARTCC (USA)",
-            "KZLA": "Los Angeles ARTCC (USA)",
-        }
-        return fir_names.get(fir) if fir else None
+        return get_fir_description(fir) if fir else None
 
     def _decode_notam_code(self, code: Optional[str]) -> Optional[str]:
-        """解码 NOTAM 代码（5 位字母，格式为 QCODE）"""
+        """解码 NOTAM 代码（QCODE 格式）
+
+        使用完整的 ICAO QCODE 数据库进行解码，支持 176 种 QCODE。
+
+        Args:
+            code: 5 位 QCODE（如 QFALC）或 4 位代码（如 FALC）
+
+        Returns:
+            QCODE 的中文描述，如无匹配则返回代码本身
+        """
         if not code:
             return None
-        # NOTAM 代码格式：QCODE，实际代码是后 4 位
+
+        # 使用 QCODE 数据库进行解码
+        description = get_qcode_description(code)
+
+        if description:
+            return description
+
+        # 如果数据库中没有，尝试前缀匹配
         actual_code = code[1:] if code.startswith('Q') and len(code) == 5 else code
 
-        code_descriptions = {
-            "FALC": "Aerodrome closed",
-            "FA": "Aerodrome",
-            "AD": "Aerodrome",
-            "RW": "Runway",
-            "TW": "Taxiway",
-            "AP": "Apron",
-            "NB": "Navigation",
-            "NA": "Navigation aids",
+        # 类别级描述（根据 QCODE 结构）
+        category_descriptions = {
+            'QA': '航路信息服务',
+            'QC': '通信',
+            'QF': '机场',
+            'QG': 'GNSS',
+            'QI': '仪表着陆系统 (ILS)',
+            'QL': '灯光',
+            'QM': '气象服务',
+            'QN': '导航设施',
+            'QO': '机场其他设施',
+            'QP': '跑道',
+            'QR': '限制空域',
+            'QS': '滑行道',
+            'QW': '警告',
+            'QX': '特殊/未分类',
         }
-        # 先尝试精确匹配，再尝试前缀匹配
-        if actual_code in code_descriptions:
-            return code_descriptions[actual_code]
-        for prefix, desc in code_descriptions.items():
-            if actual_code.startswith(prefix):
-                return desc
+
+        if len(actual_code) >= 2:
+            prefix = actual_code[:2]
+            if prefix in category_descriptions:
+                return f"{category_descriptions[prefix]} (代码：{code})"
+
         return f"NOTAM Code: {code}"
 
     def _decode_traffic(self, traffic: Optional[str]) -> str:
