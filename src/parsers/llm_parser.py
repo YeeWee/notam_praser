@@ -25,6 +25,7 @@ class LLMParserResult:
     restricted_areas: List[Dict[str, Any]] = field(default_factory=list)  # 限制区域
     raw_llm_response: Optional[str] = None  # 原始 LLM 响应
     validation_report: Optional[Dict[str, Any]] = None  # 校验报告
+    confidence_score: float = 0.0  # 置信度评分
 
 
 class LLMParser:
@@ -90,7 +91,44 @@ class LLMParser:
         # 术语校验
         result.validation_report = self._validate_terminology(result.terminology)
 
+        # 计算 LLM 解析置信度
+        result.confidence_score = self._calculate_confidence(result)
+
         return result
+
+    def _calculate_confidence(self, result: LLMParserResult) -> float:
+        """计算 LLM 解析置信度 (0-25 分，按比例转换为 0-100)
+
+        评分标准:
+        - LLM 返回有效 JSON: 10 分
+        - 摘要和翻译存在：8 分
+        - 术语校验通过：7 分
+
+        Returns:
+            置信度分数 (0-100)
+        """
+        score = 0.0
+
+        # LLM 返回有效 JSON (10 分)
+        if result.raw_llm_response:
+            score += 10.0
+
+        # 摘要和翻译存在 (8 分)
+        if result.summary:
+            score += 4.0
+        if result.translation:
+            score += 4.0
+
+        # 术语校验通过 (7 分)
+        if result.validation_report:
+            if result.validation_report.get("is_valid", False):
+                score += 7.0
+            else:
+                # 术语校验失败，部分得分
+                score += 2.0
+
+        # 转换为 0-100 分制
+        return (score / 25.0) * 100.0
 
     def _build_prompt(self, e_text: str, context: Optional[Dict[str, Any]] = None) -> str:
         """构建 LLM Prompt"""

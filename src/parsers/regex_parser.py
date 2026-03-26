@@ -91,6 +91,8 @@ class ParseResult:
     warnings: List[str] = field(default_factory=list)
     # 解析错误
     errors: List[str] = field(default_factory=list)
+    # 置信度评分
+    confidence_score: float = 0.0
 
 
 class RegexParser:
@@ -179,7 +181,81 @@ class RegexParser:
         if result.b_time is None:
             result.errors.append("缺少 B 行")
 
+        # 计算置信度分数
+        result.confidence_score = self._calculate_confidence(result)
+
         return result
+
+    def _calculate_confidence(self, result: ParseResult) -> float:
+        """计算置信度分数 (0-100)
+
+        评分模型:
+        - 必填字段完整性 (40 分)
+        - 字段有效性验证 (35 分)
+        - 错误惩罚
+
+        Returns:
+            置信度分数 (0-100)
+        """
+        score = 0.0
+
+        # 第一层：必填字段完整性 (40 分)
+        # Q 行存在且可解析 (15 分)
+        if result.q_line:
+            score += 15.0
+
+        # A 行存在 (10 分)
+        if result.a_location:
+            score += 10.0
+        else:
+            score -= 5.0  # 扣 5 分
+
+        # B 行存在且时间有效 (10 分)
+        if result.b_time:
+            score += 10.0
+        else:
+            score -= 5.0  # 扣 5 分
+
+        # E 行存在 (5 分)
+        if result.e_raw:
+            score += 5.0
+
+        # 第二层：字段有效性验证 (35 分)
+        if result.q_line:
+            # QCODE 在数据库中 (15 分)
+            if result.q_line.notam_code:
+                qcode_desc = get_qcode_description(result.q_line.notam_code)
+                if qcode_desc:
+                    score += 15.0
+
+            # FIR 在数据库中 (10 分)
+            if result.q_line.fir:
+                fir_desc = get_fir_description(result.q_line.fir)
+                if fir_desc:
+                    score += 10.0
+
+            # 坐标格式有效 (3 分)
+            if result.q_line.coordinates:
+                score += 3.0
+
+            # 半径格式有效 (2 分)
+            if result.q_line.radius:
+                score += 2.0
+
+        # C 时间 >= B 时间 (5 分)
+        if result.b_time and result.c_time:
+            if result.c_time >= result.b_time:
+                score += 5.0
+            else:
+                score -= 2.5  # 时间逻辑错误扣半分
+        elif result.b_time or result.c_is_perm:
+            score += 5.0
+
+        # 错误惩罚：每个错误扣 5 分，每个警告扣 2 分
+        # 注意：由于上面已经计算了完整性分数，这里只计算额外错误
+        # 必填字段缺失已经在完整性中扣分了，不要再重复扣
+
+        return max(0.0, min(100.0, score))
 
     def _parse_line_fields(self, line: str, result: ParseResult, notam_text: str):
         """解析单行中的所有字段（支持多字段同行）"""

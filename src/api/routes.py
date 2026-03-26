@@ -90,6 +90,8 @@ async def parse_notam(request: NotamParseRequest):
     response = NotamParseResponse(
         notam_id=notam_id,
         raw_input=request.notam_text,
+        confidence_score=regex_result.confidence_score,
+        confidence_level="low" if regex_result.confidence_score < 80.0 else None,
         q_line=_q_line_to_response(regex_result.q_line) if regex_result.q_line else None,
         a_location=regex_result.a_location,
         time_window=_build_time_window(regex_result),

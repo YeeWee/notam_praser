@@ -9,7 +9,7 @@
 - D 行结构化时间表
 - 坐标/半径结构化解析
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, Dict, Any, List
 from enum import Enum
 from datetime import datetime
@@ -159,6 +159,16 @@ class NotamParseResponse(BaseModel):
     )
     raw_input: str = Field(..., description="完整原始 NOTAM 文本")
 
+    # ==================== 置信度评分 ====================
+    confidence_score: float = Field(
+        default=0.0,
+        description="解析置信度分数 (0-100)，分数越高表示解析结果越可信"
+    )
+    confidence_level: Optional[str] = Field(
+        default=None,
+        description="置信度等级标记，'low' 表示低置信度 (<80 分)"
+    )
+
     # ==================== Q 行解析 ====================
     q_line: Optional[QLineResponse] = Field(
         None,
@@ -202,6 +212,15 @@ class NotamParseResponse(BaseModel):
 
     # ==================== 解析元数据 ====================
     parser_version: str = Field("0.3.0", description="解析器版本")
+
+    @model_validator(mode='after')
+    def set_confidence_level(self):
+        """自动计算 confidence_level"""
+        if self.confidence_score < 80.0:
+            self.confidence_level = "low"
+        else:
+            self.confidence_level = None
+        return self
 
 
 class HealthResponse(BaseModel):
