@@ -1,6 +1,7 @@
 """NOTAM 解析器集成测试
 
 端到端测试真实 NOTAM 样本的完整解析流程
+使用 datas/input_notams.csv 中的真实数据进行测试
 """
 import pytest
 from fastapi.testclient import TestClient
@@ -11,9 +12,29 @@ from src.parsers.llm_parser import LLMParser
 from src.parsers.terminology_db import get_terminology_db
 from src.database import NotamCache, init_cache
 from src.config import get_settings
+from unittest.mock import patch
+from tests.utils.notam_data_loader import (
+    load_all_notams,
+    get_samples_by_top_qcodes,
+    extract_e_line,
+    extract_qcode,
+)
 
 
-# 真实 NOTAM 样本
+@pytest.fixture(scope="session")
+def real_notam_samples():
+    """从真实数据加载 NOTAM 样本"""
+    notams = load_all_notams()
+    return get_samples_by_top_qcodes(notams, top_n=20, samples_per_qcode=2)
+
+
+@pytest.fixture(scope="session")
+def all_notams():
+    """加载所有真实 NOTAM"""
+    return load_all_notams()
+
+
+# 保留硬编码样本用于快速测试
 SAMPLE_NOTAMS = [
     # 样本 1: 跑道关闭
     """Q)EGTT/QFALC/IV/NBO/A/000/999/5147N00028W005
@@ -353,10 +374,109 @@ class TestPerformanceIntegration:
 
         notam = SAMPLE_NOTAMS[0]
 
+
+# =============================================================================
+# 真实数据集成测试
+# =============================================================================
+
+class TestRealDataIntegration:
+    """使用真实 NOTAM 数据的集成测试"""
+
+    @pytest.fixture
+    def parser(self):
+        return RegexParser()
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(app)
+
+    def test_parse_real_notam_samples(self, parser, real_notam_samples):
+        """解析真实 NOTAM 样本"""
+        success_count = 0
+
+        for sample in real_notam_samples[:10]:
+            result = parser.parse(sample)
+            if result.q_line is not None:
+                success_count += 1
+
+        # 至少 80% 应该成功
+        assert success_count >= 8, f"真实 NOTAM 解析成功率过低：{success_count}/10"
+
+    def test_api_parse_real_samples(self, client, real_notam_samples):
+        """API 解析真实 NOTAM 样本"""
+        success_count = 0
+
+        for sample in real_notam_samples[:10]:
+            response = client.post(
+                "/api/v1/parse",
+                json={"notam_text": sample, "include_llm": False}
+            )
+            if response.status_code == 200:
+                success_count += 1
+
+        assert success_count >= 8, f"API 解析真实 NOTAM 成功率过低：{success_count}/10"
+
+    def test_real_data_qcode_coverage(self, parser, all_notams):
+        """真实数据 QCODE 覆盖测试"""
+        # 从所有 NOTAM 中随机选择 20 个不同 QCODE 的样本
+        from tests.utils.notam_data_loader import group_by_qcode, get_top_qcodes
+
+        qcode_groups = group_by_qcode(all_notams)
+        top_qcodes = get_top_qcodes(all_notams, top_n=20)
+
+        success_count = 0
+        failed_qcodes = []
+
+        for qcode in top_qcodes:
+            samples = qcode_groups.get(qcode, [])
+            if samples:
+                result = parser.parse(samples[0])
+                if result.q_line is not None:
+                    success_count += 1
+                else:
+                    failed_qcodes.append(qcode)
+
+        print(f"\nQCODE 覆盖测试:")
+        print(f"  成功：{success_count}/20")
+        if failed_qcodes:
+            print(f"  失败：{failed_qcodes}")
+
+        # 至少 90% 应该成功
+        assert success_count >= 18, f"QCODE 覆盖率过低：{success_count}/20"
+
+    @pytest.mark.slow
+    def test_real_data_batch_parse(self, client, all_notams):
+        """批量解析真实 NOTAM（慢速测试）"""
+        import time
+
+        # 测试 50 条 NOTAM
+        samples = all_notams[:50]
+
+        start_time = time.time()
+        success_count = 0
+
+        for sample in samples:
+            response = client.post(
+                "/api/v1/parse",
+                json={"notam_text": sample, "include_llm": False}
+            )
+            if response.status_code == 200:
+                success_count += 1
+
+        elapsed = time.time() - start_time
+
+        print(f"\n批量解析测试:")
+        print(f"  总数：{len(samples)}")
+        print(f"  成功：{success_count}")
+        print(f"  耗时：{elapsed:.2f}秒")
+
+        assert success_count >= 40, f"批量解析成功率过低：{success_count}/50"
+        assert elapsed < 30, f"批量解析耗时过长：{elapsed:.2f}秒"
+
         start = time.time()
-        response = self.client.post(
+        response = client.post(
             "/api/v1/parse",
-            json={"notam_text": notam, "include_llm": False}
+            json={"notam_text": samples[0], "include_llm": False}
         )
         end = time.time()
 
