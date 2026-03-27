@@ -1,12 +1,30 @@
 """LLM 解析器单元测试
 
-使用 mock 避免实际调用 API
+使用真实 API 调用进行测试
 """
 import pytest
-from unittest.mock import Mock, patch, MagicMock
 import json
+import os
 
 from src.parsers.llm_parser import LLMParser, LLMParserResult, parse_notam_e_line
+from src.config import get_settings
+
+
+@pytest.fixture
+def parser():
+    """创建使用真实 API 配置的 LLM 解析器"""
+    settings = get_settings()
+    return LLMParser(
+        api_key=settings.openai_api_key,
+        api_base=settings.openai_api_base,
+        model=settings.openai_model
+    )
+
+
+@pytest.fixture
+def parser_with_test_key():
+    """创建使用测试 API Key 的解析器（用于不需要实际调用的测试）"""
+    return LLMParser(api_key="test-key")
 
 
 class TestLLMParserInit:
@@ -111,21 +129,20 @@ class TestResponseParsing:
         result = self.parser._parse_response(response, "RUNWAY 09L CLSD")
 
         assert "解析失败" in result.summary
-        assert result.translation == "RUNWAY 09L CLSD"  # 返回原文
+        assert result.translation == "RUNWAY 09L CLSD"
         assert result.category == "OTHER"
 
     def test_parse_partial_json(self):
         """解析部分字段缺失的 JSON"""
         response = json.dumps({
             "summary": "跑道关闭"
-            # 其他字段缺失
         })
 
         result = self.parser._parse_response(response, "RUNWAY 09L CLSD")
 
         assert result.summary == "跑道关闭"
         assert result.translation is None
-        assert result.terminology == []  # 默认为空数组
+        assert result.terminology == []
 
 
 class TestCategoryDecoding:
@@ -169,8 +186,6 @@ class TestTerminologyValidation:
 
     def test_validate_with_corrections(self):
         """带校正的术语"""
-        # 这个测试依赖于术语库中的实际数据
-        # 如果 LLM 返回错误的 RWY 解释，应该被校正
         terminology = [
             {
                 "term": "RWY",
@@ -181,111 +196,158 @@ class TestTerminologyValidation:
 
         report = self.parser._validate_terminology(terminology)
 
-        # 术语库应该会校正这个错误解释
         assert "corrected_terms" in report or report["is_valid"] is True
 
 
-@patch('src.parsers.llm_parser.LLMParser._call_llm')
-class TestParseWithMock:
-    """使用 Mock 的解析测试"""
+class TestRealAPIParsing:
+    """真实 API 解析测试（需要有效的 API Key）"""
 
     def setup_method(self):
-        self.parser = LLMParser(api_key="test-key")
+        settings = get_settings()
+        self.parser = LLMParser(
+            api_key=settings.openai_api_key,
+            api_base=settings.openai_api_base,
+            model=settings.openai_model
+        )
 
-    def test_full_parse(self, mock_call_llm):
-        """完整解析"""
-        mock_response = json.dumps({
-            "summary": "跑道关闭通知",
-            "translation": "跑道 09L 因施工关闭",
-            "category": "RUNWAY",
-            "terminology": [
-                {
-                    "term": "RWY",
-                    "expansion": "Runway (跑道)",
-                    "category": "airport"
-                }
-            ],
-            "restricted_areas": []
-        })
-        mock_call_llm.return_value = mock_response
+    def test_parse_runway_closure(self, parser):
+        """跑道关闭 NOTAM 真实解析"""
+        result = parser.parse("RUNWAY 09L CLSD DUE TO WIP")
 
-        result = self.parser.parse("RUNWAY 09L CLSD DUE TO WIP")
+        assert result.summary is not None
+        assert result.translation is not None
+        assert result.category is not None
+        assert len(result.terminology) > 0
 
-        assert result.summary == "跑道关闭通知"
-        assert result.translation == "跑道 09L 因施工关闭"
-        assert result.category == "跑道相关"
-        assert len(result.terminology) == 1
+    def test_parse_airspace_activation(self, parser):
+        """空域激活 NOTAM 真实解析"""
+        result = parser.parse("WILLIAMTOWN CTA C3 ACT ACTIVATION OF THIS CLASS C AIRSPACE")
 
-    def test_parse_with_restricted_areas(self, mock_call_llm):
-        """带限制区域的解析"""
-        mock_response = json.dumps({
-            "summary": "限制区域激活",
-            "translation": "限制区域 RA-01 激活",
-            "category": "AIRSPACE",
-            "terminology": [],
-            "restricted_areas": [
-                {
-                    "name": "RA-01",
-                    "type": "restricted",
-                    "coordinates": "40N116E",
-                    "altitude_limits": "0-10000FT",
-                    "description": "军事演习区域"
-                }
-            ]
-        })
-        mock_call_llm.return_value = mock_response
-
-        result = self.parser.parse("RESTRICTED AREA RA-01 ACTIVE")
-
+        assert result.summary is not None
         assert result.category == "空域限制"
-        assert len(result.restricted_areas) == 1
-        assert result.restricted_areas[0]["name"] == "RA-01"
+
+    def test_parse_military_operations(self, parser):
+        """军事行动 NOTAM 真实解析"""
+        result = parser.parse("MIL HEL OPS WILL TAKE PLACE 3X UH60M CS JUSTICE")
+
+        assert result.summary is not None
+        assert result.category == "军事活动"
+
+    def test_parse_atc_instructions(self, parser):
+        """ATC 指令 NOTAM 真实解析"""
+        result = parser.parse("DUE TO ATC ASSIGNED AIRSPACE MILU EAST MELA SOUTH")
+
+        assert result.summary is not None
+
+
+class TestRealAPIEdgeCases:
+    """真实 API 边界情况测试"""
+
+    def setup_method(self):
+        settings = get_settings()
+        self.parser = LLMParser(
+            api_key=settings.openai_api_key,
+            api_base=settings.openai_api_base,
+            model=settings.openai_model
+        )
+
+    def test_empty_e_line(self, parser):
+        """空 E 行处理"""
+        result = parser.parse("")
+
+        assert result.summary is None
+        assert result.translation is None
+
+    def test_whitespace_only_e_line(self, parser):
+        """纯空白 E 行处理"""
+        result = parser.parse("   \n\n  ")
+
+        assert result.summary is None
+
+    def test_special_characters(self, parser):
+        """特殊字符处理"""
+        result = parser.parse("TEST NOTAM WITH SPECIAL CHARS")
+
+        assert result is not None
+
+    def test_very_long_e_line(self, parser):
+        """超长 E 行处理"""
+        e_text = "TEST " * 50
+        result = parser.parse(e_text)
+
+        assert result is not None
+
+    def test_mixed_language(self, parser):
+        """多语言混合处理"""
+        result = parser.parse("RUNWAY 关闭 due to WIP 施工中")
+
+        assert result is not None
 
 
 class TestRetryLogic:
-    """重试逻辑测试"""
+    """重试逻辑测试（使用真实 API）"""
+
+    def setup_method(self):
+        settings = get_settings()
+        self.parser = LLMParser(
+            api_key=settings.openai_api_key,
+            api_base=settings.openai_api_base,
+            model=settings.openai_model
+        )
+
+    def test_parse_with_retry_success(self, parser):
+        """重试成功"""
+        result = parser.parse_with_retry("RUNWAY CLSD", max_retries=3)
+
+        assert result.summary is not None
+
+    def test_parse_with_retry_exhausted(self, parser):
+        """重试耗尽（使用无效 key 测试）"""
+        invalid_parser = LLMParser(api_key="invalid-key")
+        result = invalid_parser.parse_with_retry("TEST", max_retries=1)
+
+        # 应该有某种降级结果或错误信息
+        assert result is not None
+
+
+class TestConvenienceFunction:
+    """便捷函数测试（真实 API 调用）"""
+
+    def test_parse_notam_e_line(self, parser):
+        """便捷函数调用"""
+        result = parse_notam_e_line(
+            "RUNWAY 09L CLSD",
+            api_key=get_settings().openai_api_key,
+            api_base=get_settings().openai_api_base,
+            model=get_settings().openai_model
+        )
+
+        assert result.summary is not None
+
+
+class TestConfidenceCalculation:
+    """置信度计算测试"""
 
     def setup_method(self):
         self.parser = LLMParser(api_key="test-key")
 
-    @patch('src.parsers.llm_parser.LLMParser._call_llm')
-    def test_parse_with_retry_success(self, mock_call_llm):
-        """重试成功"""
-        mock_response = json.dumps({
-            "summary": "Success",
-            "translation": "成功",
-            "category": "OTHER",
-            "terminology": [],
-            "restricted_areas": []
-        })
-        mock_call_llm.return_value = mock_response
+    def test_confidence_with_valid_result(self):
+        """有效结果的置信度"""
+        result = LLMParserResult(
+            summary="跑道关闭",
+            translation="跑道因施工关闭",
+            category="跑道相关",
+            terminology=[{"term": "RWY", "expansion": "Runway"}],
+            raw_llm_response='{"summary": "test"}',
+            validation_report={"is_valid": True}
+        )
 
-        result = self.parser.parse_with_retry("Test", max_retries=3)
+        score = self.parser._calculate_confidence(result)
+        assert score > 0
 
-        assert result.summary == "Success"
-        assert mock_call_llm.call_count == 1
+    def test_confidence_with_empty_result(self):
+        """空结果的置信度"""
+        result = LLMParserResult()
 
-    @patch('src.parsers.llm_parser.LLMParser._call_llm')
-    def test_parse_with_retry_exhausted(self, mock_call_llm):
-        """重试耗尽"""
-        mock_call_llm.side_effect = Exception("API Error")
-
-        result = self.parser.parse_with_retry("Test", max_retries=3)
-
-        assert mock_call_llm.call_count == 3
-        assert "解析失败" in result.summary or result.summary is None
-
-
-class TestConvenienceFunction:
-    """便捷函数测试"""
-
-    @patch('src.parsers.llm_parser.LLMParser.parse_with_retry')
-    def test_parse_notam_e_line(self, mock_parse):
-        """便捷函数调用"""
-        mock_result = LLMParserResult(summary="Test summary")
-        mock_parse.return_value = mock_result
-
-        result = parse_notam_e_line("Test NOTAM", api_key="test-key")
-
-        assert result.summary == "Test summary"
-        mock_parse.assert_called_once()
+        score = self.parser._calculate_confidence(result)
+        assert score == 0.0

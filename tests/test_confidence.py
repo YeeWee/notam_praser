@@ -2,6 +2,7 @@
 import pytest
 from src.parsers.regex_parser import RegexParser, ParseResult
 from src.parsers.llm_parser import LLMParser, LLMParserResult
+from src.config import get_settings
 
 
 class TestRegexParserConfidence:
@@ -114,14 +115,13 @@ class TestLLMParserConfidence:
 
     def test_llm_confidence_with_valid_response(self):
         """LLM 返回有效响应应该获得高置信度"""
-        # 注意：这个测试需要实际的 API key，如果没有会跳过
-        import os
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            pytest.skip("OPENAI_API_KEY not set")
-
+        settings = get_settings()
         e_text = "RUNWAY 09L CLSD DUE TO WIP"
-        parser = LLMParser(api_key=api_key)
+        parser = LLMParser(
+            api_key=settings.openai_api_key,
+            api_base=settings.openai_api_base,
+            model=settings.openai_model
+        )
         result = parser.parse(e_text)
 
         assert result.confidence_score > 0, "LLM 解析应该有置信度分数"

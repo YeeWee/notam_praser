@@ -10,7 +10,7 @@ from src.parsers.regex_parser import RegexParser
 from src.parsers.llm_parser import LLMParser
 from src.parsers.terminology_db import get_terminology_db
 from src.database import NotamCache, init_cache
-from unittest.mock import patch
+from src.config import get_settings
 
 
 # 真实 NOTAM 样本
@@ -140,23 +140,15 @@ class TestFullPipelineIntegration:
 
     def setup_method(self):
         self.regex_parser = RegexParser()
+        settings = get_settings()
+        self.llm_parser = LLMParser(
+            api_key=settings.openai_api_key,
+            api_base=settings.openai_api_base,
+            model=settings.openai_model
+        )
 
-    @patch.object(LLMParser, '_call_llm')
-    def test_end_to_end_parse(self, mock_llm_call):
-        """端到端解析（Mock LLM）"""
-        # Mock LLM 响应
-        mock_llm_call.return_value = """{
-            "summary": "跑道 09L 因施工关闭",
-            "translation": "跑道 09L 因施工关闭。航空器可能被要求在跑道 09L 外等待。",
-            "category": "RUNWAY",
-            "terminology": [
-                {"term": "RWY", "expansion": "Runway (跑道)", "category": "airport"},
-                {"term": "CLSD", "expansion": "Closed (关闭)", "category": "status"},
-                {"term": "WIP", "expansion": "Work In Progress (施工中)", "category": "status"}
-            ],
-            "restricted_areas": []
-        }"""
-
+    def test_end_to_end_parse(self):
+        """端到端解析（真实 API 调用）"""
         notam = SAMPLE_NOTAMS[0]
 
         # Step 1: 正则解析
@@ -165,8 +157,7 @@ class TestFullPipelineIntegration:
         assert regex_result.e_raw is not None
 
         # Step 2: LLM 解析
-        llm_parser = LLMParser(api_key="test-key")
-        llm_result = llm_parser.parse(regex_result.e_raw)
+        llm_result = self.llm_parser.parse(regex_result.e_raw)
 
         assert llm_result.summary is not None
         assert llm_result.translation is not None
