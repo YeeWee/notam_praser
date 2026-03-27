@@ -4,66 +4,40 @@
 1. 覆盖不同 QCODE 类型的 E 行解析
 2. 测试边界情况（空 E 行、特殊字符、多语言等）
 3. 验证 LLM 解析与 JSON Schema 的兼容性
+4. 真实 LLM API 调用测试（需要配置 OPENAI_API_KEY）
 """
 import pytest
 import csv
 import re
+import os
 from unittest.mock import patch, MagicMock
 import json
 
 from src.parsers.llm_parser import LLMParser, LLMParserResult
 from src.parsers.regex_parser import RegexParser
 from src.api.models import EParsedResponse
+from tests.utils.notam_data_loader import (
+    load_all_notams,
+    group_by_qcode,
+    get_top_qcodes,
+    extract_e_line,
+    extract_qcode,
+    get_samples_by_top_qcodes,
+)
+from tests.utils.llm_test_helper import (
+    is_llm_api_available,
+    skip_if_no_llm_api,
+    cached_llm_call,
+)
 
 
+# 使用统一的数据加载器
 def load_notam_samples(filepath="datas/input_notams.csv", max_samples=20):
-    """从 CSV 文件加载 NOTAM 样本
+    """从 CSV 文件加载 NOTAM 样本（兼容旧接口）"""
+    from tests.utils.notam_data_loader import load_all_notams, get_samples_by_top_qcodes
 
-    Args:
-        filepath: CSV 文件路径
-        max_samples: 最大加载样本数
-
-    Returns:
-        包含不同 QCODE 的 NOTAM 样本列表
-    """
-    samples = {}
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            for row in reader:
-                row_text = ''.join(row)
-                if 'Q)' in row_text and row_text.strip().startswith('"') or row_text.strip().startswith('Q)'):
-                    # 清理数据
-                    row_text = row_text.strip().strip('"')
-
-                    # 提取 QCODE
-                    qcode_match = re.search(r'Q\)[A-Z]{4}/([A-Z]{5})/', row_text)
-                    if qcode_match:
-                        qcode = qcode_match.group(1)
-                        if qcode not in samples:
-                            samples[qcode] = row_text
-
-                    if len(samples) >= max_samples:
-                        break
-    except FileNotFoundError:
-        pytest.skip(f"数据文件 {filepath} 未找到")
-
-    return list(samples.values())
-
-
-def extract_e_line(notam_text: str) -> str:
-    """从 NOTAM 文本提取 E 行内容"""
-    # 匹配 E) 到下一个字段标记或结尾
-    match = re.search(r'E\)(.*?)(?:\n[A-Z]\)|\nNNNN|$)', notam_text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return ""
-
-
-def extract_qcode(notam_text: str) -> str:
-    """从 NOTAM 文本提取 QCODE"""
-    match = re.search(r'Q\)[A-Z]{4}/([A-Z]{5})/', notam_text)
-    return match.group(1) if match else "UNKNOWN"
+    notams = load_all_notams()
+    return get_samples_by_top_qcodes(notams, top_n=max_samples, samples_per_qcode=1)
 
 
 class TestELineExtraction:
@@ -614,3 +588,134 @@ class TestContextBuilding:
 
         assert "EGTT" in prompt
         assert "QFALC" in prompt
+
+
+# =============================================================================
+# 真实 LLM API 调用测试
+# =============================================================================
+
+@pytest.mark.real_llm
+class TestLLMParsingWithRealAPI:
+    """使用真实 LLM API 的解析测试
+
+    需要配置 OPENAI_API_KEY 在 .env 文件中
+    """
+
+    @pytest.fixture
+    def parser(self, openai_api_key, openai_api_base, openai_model):
+        """创建使用真实 API 的解析器"""
+        return LLMParser(
+            api_key=openai_api_key,
+            api_base=openai_api_base,
+            model=openai_model,
+        )
+
+    @pytest.fixture
+    def real_notam_samples(self):
+        """加载真实 NOTAM 样本"""
+        notams = load_all_notams()
+        return get_samples_by_top_qcodes(notams, top_n=10, samples_per_qcode=2)
+
+    def test_real_api_parse_single_notam(self, parser, real_notam_samples):
+        """真实 API 解析单个 NOTAM"""
+        if not is_llm_api_available():
+            pytest.skip("OPENAI_API_KEY not configured")
+
+        sample = real_notam_samples[0]
+        e_line = extract_e_line(sample)
+
+        if not e_line:
+            pytest.skip("E 行为空")
+
+        result = parser.parse(e_line)
+
+        # 验证基本字段
+        assert result.summary is not None, "LLM 摘要生成失败"
+
+        # 验证可以转换为 EParsedResponse
+        response = EParsedResponse(
+            summary=result.summary,
+            translation=result.translation,
+            category=result.category,
+            terminology=result.terminology,
+            restricted_areas=result.restricted_areas,
+        )
+        assert response is not None
+
+    @pytest.mark.slow
+    def test_real_api_parse_multiple_notams(self, parser, real_notam_samples):
+        """真实 API 解析多个 NOTAM（慢速测试）"""
+        if not is_llm_api_available():
+            pytest.skip("OPENAI_API_KEY not configured")
+
+        results = []
+        failed = []
+        processed = 0
+
+        for sample in real_notam_samples:
+            e_line = extract_e_line(sample)
+            if not e_line:
+                continue
+
+            processed += 1
+            try:
+                result = parser.parse(e_line)
+                if result.summary:
+                    results.append({
+                        'qcode': extract_qcode(sample),
+                        'summary': result.summary,
+                    })
+                else:
+                    failed.append(sample[:100])
+            except Exception as e:
+                failed.append(str(e))
+
+        print(f"\n真实 API 解析统计:")
+        print(f"  处理：{processed}")
+        print(f"  成功：{len(results)}")
+        print(f"  失败：{len(failed)}")
+
+        # 至少 60% 应该成功（基于实际处理的数量）
+        assert len(results) >= processed * 0.6, \
+            f"真实 API 解析成功率过低：{len(results)}/{processed}"
+
+    def test_real_api_category_decoding(self, parser, real_notam_samples):
+        """真实 API 分类解码测试"""
+        if not is_llm_api_available():
+            pytest.skip("OPENAI_API_KEY not configured")
+
+        categories = set()
+
+        for sample in real_notam_samples[:5]:
+            e_line = extract_e_line(sample)
+            if not e_line:
+                continue
+
+            result = parser.parse(e_line)
+            if result.category:
+                categories.add(result.category)
+
+        print(f"\n解析到的分类：{categories}")
+        # 应该能解析出多种分类
+        assert len(categories) >= 1, "未能解析出任何分类"
+
+    def test_real_api_terminology_validation(self, parser, real_notam_samples):
+        """真实 API 术语验证测试"""
+        if not is_llm_api_available():
+            pytest.skip("OPENAI_API_KEY not configured")
+
+        sample = real_notam_samples[0]
+        e_line = extract_e_line(sample)
+
+        if not e_line:
+            pytest.skip("E 行为空")
+
+        result = parser.parse(e_line)
+
+        # 验证术语校验报告存在
+        assert result.validation_report is not None, "缺少术语校验报告"
+
+        # 验证报告结构
+        if result.terminology:
+            assert 'is_valid' in result.validation_report or \
+                   'terminology_corrected' in result.validation_report
